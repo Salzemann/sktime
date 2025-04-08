@@ -2417,38 +2417,57 @@ class RecursiveReductionForecaster(BaseForecaster, _ReducerMixin):
                 f"but found {impute_method}"
             )
 
-    def create_lagged_features(self, y):
-        """Create lagged time-based features from y and shift them for alignment.
+    def create_lagged_features(self, y, X=None):
+        """Create lagged time-based features from y and optionally X, aligned for forecasting.
 
         This function applies a lag transformation to `y` to create features for
         time series forecasting. The features are then shifted forward so they
         predict the next step in recursive forecasting.
+        If `X` is provided and `self.X_treatment` is "shifted", it will be lagged
+        by 1 to align with the target variable `y(t+1)`.
 
         Parameters
         ----------
         y : pd.DataFrame
-            The endogenous time series used to generate lagged features.
+            Endogenous target time series.
+        X : pd.DataFrame, optional
+            Exogenous time series. If self.X_treatment == "shifted", it will be lagged by 1.
 
         Returns
         -------
-        X_lagged_aligned : pd.DataFrame
-            A transformed dataset where lagged features are shifted to align
-            with the next target value `y(t+1)`.
+        X_features : pd.DataFrame
+            DataFrame of aligned features including lagged y and optionally shifted X.
+        valid_idx : pd.Index
+            Index of time points with valid (non-NaN) features.
         """
         from sktime.transformations.series.lag import Lag
 
-        lags = self._lags
-        lagger_y_to_X = Lag(lags=lags, index_out="extend")
-
+        # Lag target y with custom lags
+        lagger_y_to_X = Lag(lags=self._lags, index_out="extend")
         if self._impute_method is not None:
             lagger_y_to_X = lagger_y_to_X * self._impute_method.clone()
-        self.lagger_y_to_X_ = lagger_y_to_X
 
+        self.lagger_y_to_X_ = lagger_y_to_X
         X_time = lagger_y_to_X.fit_transform(y)
 
-        lag_shifter = Lag(lags=1, index_out="extend")
+        # Shift lagged features by one to align with y(t+1)
+        lag_shifter = Lag(lags=1, index_out="extend", keep_column_names=True)
         X_time_aligned = lag_shifter.fit_transform(X_time)
-        return X_time_aligned
+
+        # Filter to valid index
+        valid_idx = _get_notna_idx(X_time_aligned).intersection(y.index)
+        X_time_aligned = X_time_aligned.loc[valid_idx]
+
+        # If exogenous X exists and needs shifting, apply the same shift
+        if X is not None:
+            if self.X_treatment == "shifted":
+                X = lag_shifter.fit_transform(X)
+            X = X.loc[valid_idx]
+            X_combined = pd.concat([X, X_time_aligned], axis=1)
+        else:
+            X_combined = X_time_aligned
+
+        return X_combined, valid_idx
 
     def _fit(self, y, X, fh):
         """Fit forecaster to training data.
@@ -2472,46 +2491,18 @@ class RecursiveReductionForecaster(BaseForecaster, _ReducerMixin):
         -------
         self : reference to self
         """
-        # todo: very similar to _fit_concurrent of DirectReductionForecaster - refactor?
-        from sktime.transformations.series.lag import Lag
+        # Create aligned lagged features (including shifted X if needed)
+        X, valid_idx = self.create_lagged_features(y, X)
 
-        # impute_method = self._impute_method
-        X_treatment = self.X_treatment
-
-        # lagger_y_to_X_ will lag y and later concat X to obtain the sklearn X
-        lags = self._lags
-        lagger_y_to_X = Lag(lags=lags, index_out="extend")
-
-        # if impute_method is not None:
-        #    lagger_y_to_X = lagger_y_to_X * impute_method.clone()
-        self.lagger_y_to_X_ = lagger_y_to_X
-
-        Xt = lagger_y_to_X.fit_transform(y)
-
-        # lag is 1, since we want to do recursive forecasting with 1 step ahead
-        # column names will be kept for consistency
-        lag_plus = Lag(lags=1, index_out="extend", keep_column_names=True)
-        Xtt = lag_plus.fit_transform(Xt)
-        Xtt_notna_idx = _get_notna_idx(Xtt)
-        notna_idx = Xtt_notna_idx.intersection(y.index)
-
-        # yt is the target forecast value
-        yt = y.loc[notna_idx]
-        Xtt = Xtt.loc[notna_idx]
-
-        if len(notna_idx) == 0:
+        if len(valid_idx) == 0:
             self.estimator_ = y.mean()
         else:
-            if X is not None:
-                # if X_treatment is shifted, lag X by 1 to obtain X(t+1) i.e. X_inner
-                X_inner = lag_plus.fit_transform(X) if X_treatment == "shifted" else X
-                Xtt = pd.concat([X_inner.loc[notna_idx], Xtt], axis=1)
-
-            Xtt = prep_skl_df(Xtt)
-            yt = prep_skl_df(yt)
+            y = y.loc[valid_idx]
+            X = prep_skl_df(X)
+            y = prep_skl_df(y)
 
             estimator = clone(self.estimator)
-            estimator.fit(Xtt, yt)
+            estimator.fit(X, y)
             self.estimator_ = estimator
 
         return self
